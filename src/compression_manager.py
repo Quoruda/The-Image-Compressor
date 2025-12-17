@@ -3,6 +3,52 @@ from PIL import Image
 from multiprocessing import Pool, cpu_count
 from fractal_compressor import FractalCompressor
 from compressed_data import CompressedData
+from numba import njit
+
+
+# --- NUMBA OPTIMIZED BIT PACKING ---
+
+@njit(fastmath=True)
+def jit_pack_transforms(src_array, ori_array, s_array, o_array, count, packed_dtype_is_uint16):
+    """
+    Boucle de compactage binaire optimisée Numba.
+    Remplace la boucle Python lente.
+    """
+    # Création du dtype structuré manuellement difficile en Numba pur,
+    # on retourne donc des arrays séparés qu'on assemblera ou un array d'entiers si on simplifie.
+    # Pour garder la structure 'void' de numpy, on va remplir des arrays simples ici
+    # et numpy fera l'assignation finale rapidement.
+
+    packed_src_ori = np.zeros(count, dtype=np.uint32)
+    packed_s = np.zeros(count, dtype=np.int8)
+    packed_o = np.zeros(count, dtype=np.uint8)
+
+    for i in range(count):
+        src = src_array[i]
+        ori = ori_array[i]
+        s = s_array[i]
+        o_val = o_array[i]
+
+        # Bit Packing logic
+        packed_src_ori[i] = (src << 3) | (ori & 7)
+
+        # Quantification S
+        s_clamped = s * 127.0
+        if s_clamped > 127:
+            s_clamped = 127
+        elif s_clamped < -127:
+            s_clamped = -127
+        packed_s[i] = int(s_clamped)
+
+        # Quantification O
+        o_clamped = (o_val + 1.0) * 85.0
+        if o_clamped > 255:
+            o_clamped = 255
+        elif o_clamped < 0:
+            o_clamped = 0
+        packed_o[i] = int(o_clamped)
+
+    return packed_src_ori, packed_s, packed_o
 
 
 class CompressionManager:
@@ -10,35 +56,42 @@ class CompressionManager:
     @staticmethod
     def _quantize_transforms(transforms):
         """
-        Optimisation Stockage (Bit Packing) :
-        Convertit les données en binaire compact.
-
-        NOUVEAU : Fusionne l'index source (src) et l'orientation (ori)
-        dans le même entier pour économiser 1 octet par bloc (20% de gain).
+        Optimisation Stockage (Bit Packing) avec accélération Numba.
         """
         count = len(transforms)
         if count == 0:
             return np.array([], dtype=np.uint8)
 
-        # 1. Analyse pour la taille optimale
-        max_src_index = 0
-        for t in transforms:
-            if t[0] > max_src_index:
-                max_src_index = t[0]
+        # Conversion préalable en arrays pour Numba
+        # transforms est une liste de tuples (src, ori, s, o)
+        # Zip est rapide, mais np.array sur une grosse liste peut prendre un peu de temps.
+        # Cependant, le gain sur la boucle de calcul compense.
 
-        # On a besoin de stocker (src << 3) | ori.
-        # Donc la valeur max stockée sera environ max_src * 8.
+        # On sépare les composants
+        # Note: Cette transformation "zip(*transforms)" est efficace en Python
+        srcs, oris, ss, os_vals = zip(*transforms)
+
+        src_arr = np.array(srcs, dtype=np.int32)
+        ori_arr = np.array(oris, dtype=np.int32)
+        s_arr = np.array(ss, dtype=np.float32)
+        o_arr = np.array(os_vals, dtype=np.float32)
+
+        max_src_index = np.max(src_arr)
         max_packed_value = (max_src_index << 3) | 7
 
-        # Si la valeur combinée tient dans 65535, on reste sur du uint16 (2 octets)
-        # Cela nous permet de gérer jusqu'à 8191 blocs sources avec seulement 2 octets !
-        if max_packed_value < 65536:
+        is_uint16 = (max_packed_value < 65536)
+
+        # APPEL JIT
+        p_src_ori, p_s, p_o = jit_pack_transforms(src_arr, ori_arr, s_arr, o_arr, count, is_uint16)
+
+        # Construction du tableau structuré final
+        if is_uint16:
             packed_dtype = np.uint16
+            p_src_ori = p_src_ori.astype(np.uint16)
         else:
             packed_dtype = np.uint32
+            # p_src_ori est déjà uint32
 
-        # Structure : src_ori (2/4 octets), s (1 octet), o (1 octet)
-        # Total : 4 ou 6 octets par bloc (contre 5 ou 7 avant)
         dtype = np.dtype([
             ('src_ori', packed_dtype),
             ('s', np.int8),
@@ -46,48 +99,38 @@ class CompressionManager:
         ])
 
         packed = np.zeros(count, dtype=dtype)
-
-        for i, (src, ori, s, o) in enumerate(transforms):
-            # Bit Packing : On pousse src à gauche et on insère ori dans les 3 bits de droite
-            packed[i]['src_ori'] = (src << 3) | (ori & 7)
-
-            # s: Contraste
-            packed[i]['s'] = int(np.clip(s * 127, -127, 127))
-
-            # o: Luminosité
-            packed[i]['o'] = int(np.clip((o + 1.0) * 85.0, 0, 255))
+        packed['src_ori'] = p_src_ori
+        packed['s'] = p_s
+        packed['o'] = p_o
 
         return packed
 
     @staticmethod
     def _dequantize_transforms(packed_data):
         """
-        Reconstruit les paramètres en séparant les bits fusionnés.
+        Reconstruit les paramètres.
+        (La déquantification est rapide, on peut la laisser en NumPy vectorisé pur
+         sans forcément utiliser Numba, car NumPy gère le broadcasting très vite).
         """
         if isinstance(packed_data, list):
             return packed_data
 
-        transforms = []
-        for i in range(len(packed_data)):
-            item = packed_data[i]
+        # Version Vectorisée NumPy (plus rapide que la boucle for Python précédente)
+        # Pas besoin de Numba ici, NumPy est C-speed sur les arrays entiers.
 
-            # Unpacking des bits
-            val = int(item['src_ori'])
-            src = val >> 3  # On récupère l'index (tout sauf les 3 derniers bits)
-            ori = val & 7  # On récupère l'orientation (les 3 derniers bits seulement)
+        raw_vals = packed_data['src_ori'].astype(np.int32)
+        srcs = raw_vals >> 3
+        oris = raw_vals & 7
 
-            s = float(item['s']) / 127.0
-            o = (float(item['o']) / 85.0) - 1.0
+        ss = packed_data['s'].astype(np.float32) / 127.0
+        os_vals = (packed_data['o'].astype(np.float32) / 85.0) - 1.0
 
-            transforms.append((src, ori, s, o))
-
-        return transforms
+        # Reconstitution de la liste de tuples attendue par le compresseur
+        # zip() en python est un itérateur rapide
+        return list(zip(srcs, oris, ss, os_vals))
 
     @staticmethod
     def compress(image: Image.Image, verbose: bool = False, progress_callback=None) -> CompressedData:
-        """
-        Gère la compression YCbCr 4:2:0 avec quantification binaire dynamique.
-        """
         if image.mode != 'YCbCr':
             image = image.convert('YCbCr')
 
@@ -105,7 +148,6 @@ class CompressionManager:
             ('Cr', np.array(cr_band) / 255.0)
         ]
 
-        # Poids pour la progress bar
         pixels_y = w * h
         pixels_chroma = half_w * half_h
         total_pixels = pixels_y + pixels_chroma * 2
@@ -148,7 +190,6 @@ class CompressionManager:
                         progress_callback=cb
                     )
 
-                    # Quantification avec Bit Packing
                     packed_transforms = CompressionManager._quantize_transforms(transforms)
                     all_transforms[name] = packed_transforms
 
@@ -167,7 +208,7 @@ class CompressionManager:
             step=step,
             original_mode='YCbCr',
             subsampling='4:2:0',
-            quantization='int8_packed'  # Marqueur mis à jour
+            quantization='int8_packed_numba'
         )
 
         return archive
@@ -192,7 +233,7 @@ class CompressionManager:
                 if channel in data:
                     packed_transforms = data[channel]
 
-                    # Décompression avec Unpacking
+                    # Décompression optimisée vectorielle
                     transforms = CompressionManager._dequantize_transforms(packed_transforms)
 
                     target_h, target_w = shape
@@ -213,7 +254,6 @@ class CompressionManager:
 
             return Image.merge('YCbCr', tuple(reconstructed_bands)).convert('RGB')
 
-        # Legacy RGB
         elif original_mode == 'RGB':
             bands = []
             for c in ['R', 'G', 'B']:

@@ -2,3 +2,4 @@ ttkbootstrap
 matplotlib~=3.10.7
 numpy~=2.3.5
 pillow
+numba
