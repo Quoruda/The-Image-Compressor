@@ -94,7 +94,6 @@ class CompressionManager:
         w, h = image.size
         y_band, cb_band, cr_band = image.split()
 
-        # Sous-échantillonnage 4:2:0
         half_w = max(1, w // 2)
         half_h = max(1, h // 2)
         cb_band = cb_band.resize((half_w, half_h), Image.BICUBIC)
@@ -119,7 +118,7 @@ class CompressionManager:
 
         block_size = 8
         step = 8
-        compressor = FractalCompressor(block_size=block_size, step=step, max_orientations=8)
+        compressor8b = FractalCompressor(block_size=block_size, step=step, max_orientations=8)
 
         all_transforms = {}
         progress_state = {'base': 0.0}
@@ -141,7 +140,7 @@ class CompressionManager:
 
                     cb = make_channel_callback(weights[name])
 
-                    transforms = compressor.compress_frame(
+                    transforms = compressor8b.compress_frame(
                         img_array,
                         channel_name=name,
                         verbose=verbose,
