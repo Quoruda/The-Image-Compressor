@@ -1,25 +1,13 @@
 import numpy as np
-from typing import List, Tuple, Optional
 import time
 from multiprocessing import Pool, cpu_count
-from functools import partial
+from itertools import permutations
+import sys
 
 
 class FractalCompressor:
     def __init__(self, block_size=8, step=8, threshold_mean=0.2, threshold_std=0.2,
-                 max_orientations=4, use_parallel=True, n_jobs=None):
-        """
-        Compresseur fractal avec optimisations de vitesse.
-
-        Args:
-            block_size: Taille des blocs cibles (range blocks)
-            step: Pas de recherche pour les blocs sources
-            threshold_mean: Seuil de filtrage sur la moyenne
-            threshold_std: Seuil de filtrage sur l'écart-type
-            max_orientations: Nombre max d'orientations testées (1-8)
-            use_parallel: Active le traitement parallèle
-            n_jobs: Nombre de processus (None = auto)
-        """
+                 max_orientations=8, use_parallel=True, n_jobs=None):
         self.block_size = block_size
         self.step = step
         self.threshold_mean = threshold_mean
@@ -27,17 +15,10 @@ class FractalCompressor:
         self.max_orientations = max_orientations
         self.use_parallel = use_parallel
         self.n_jobs = n_jobs or max(1, cpu_count() - 1)
-
-        # Cache pour les transformations
-        self._transform_cache = {}
-
-        # Statistiques
         self.last_compression_stats = {}
 
     def reduce(self, img, factor):
-        """Réduit la taille d'une image par moyennage."""
-        if factor == 1:
-            return img.copy()
+        if factor == 1: return img.copy()
         h, w = img.shape
         new_h, new_w = h // factor, w // factor
         return img[:new_h * factor, :new_w * factor].reshape(
@@ -45,41 +26,23 @@ class FractalCompressor:
         ).mean(axis=(1, 3))
 
     def get_transforms_fast(self, block, max_count=None):
-        """
-        Génère seulement les N premières orientations.
-        Ordre optimisé : identité, rot180, rot90, rot270, puis flips
-        """
-        if max_count is None:
-            max_count = self.max_orientations
-
+        if max_count is None: max_count = self.max_orientations
         transforms = []
-        if max_count >= 1:
-            transforms.append(block)  # Identité (le plus fréquent)
-        if max_count >= 2:
-            transforms.append(np.rot90(block, 2))  # Rotation 180°
-        if max_count >= 3:
-            transforms.append(np.rot90(block, 1))  # Rotation 90°
-        if max_count >= 4:
-            transforms.append(np.rot90(block, 3))  # Rotation 270°
-        if max_count >= 5:
-            transforms.append(np.flipud(block))  # Flip vertical
-        if max_count >= 6:
-            transforms.append(np.rot90(np.flipud(block), 1))
-        if max_count >= 7:
-            transforms.append(np.rot90(np.flipud(block), 2))
-        if max_count >= 8:
-            transforms.append(np.rot90(np.flipud(block), 3))
-
+        if max_count >= 1: transforms.append(block)
+        if max_count >= 2: transforms.append(np.rot90(block, 2))
+        if max_count >= 3: transforms.append(np.rot90(block, 1))
+        if max_count >= 4: transforms.append(np.rot90(block, 3))
+        if max_count >= 5: transforms.append(np.flipud(block))
+        if max_count >= 6: transforms.append(np.rot90(np.flipud(block), 1))
+        if max_count >= 7: transforms.append(np.rot90(np.flipud(block), 2))
+        if max_count >= 8: transforms.append(np.rot90(np.flipud(block), 3))
         return transforms
 
     def compute_affine_params_fast(self, source, target):
-        """Version optimisée du calcul des paramètres affines."""
-        # Précalcul pour éviter les répétitions
         src_flat = source.flatten()
         tgt_flat = target.flatten()
         n = src_flat.size
 
-        # Calcul direct des moindres carrés (plus rapide que lstsq)
         sum_s = np.sum(src_flat)
         sum_t = np.sum(tgt_flat)
         sum_ss = np.sum(src_flat * src_flat)
@@ -88,90 +51,152 @@ class FractalCompressor:
         denom = n * sum_ss - sum_s * sum_s
 
         if abs(denom) < 1e-10:
-            # Matrice quasi-singulière
             return 0.0, np.mean(tgt_flat), float('inf')
 
         s = (n * sum_st - sum_s * sum_t) / denom
         o = (sum_t - s * sum_s) / n
-
-        # Clamp pour convergence
         s = np.clip(s, -0.9, 0.9)
 
-        # Erreur
         approx = s * src_flat + o
         error = np.sum((tgt_flat - approx) ** 2)
-
         return s, o, error
 
-    def _process_target_block(self, args):
-        """Traite un bloc cible (pour parallélisation)."""
-        y, x, target_block, sources, source_stats = args
+    def _classify_block(self, block):
+        """
+        NOUVEAU : Classification par Quadrants (Jacquin's method).
+        Divise le bloc en 4 et retourne l'ordre des indices triés par luminosité.
+        Il y a 24 classes possibles (permutations de 0,1,2,3).
+        """
+        h, w = block.shape
+        mh, mw = h // 2, w // 2
 
+        # Calcul de la moyenne des 4 quadrants
+        # 0: Haut-Gauche, 1: Haut-Droite, 2: Bas-Gauche, 3: Bas-Droite
+        means = [
+            np.mean(block[:mh, :mw]),
+            np.mean(block[:mh, mw:]),
+            np.mean(block[mh:, :mw]),
+            np.mean(block[mh:, mw:])
+        ]
+
+        # Retourne un tuple d'indices triés par luminosité croissante.
+        # Ex: (2, 0, 3, 1) -> Le quadrant 2 est le plus sombre, le 1 le plus clair.
+        return tuple(np.argsort(means))
+
+    def _process_target_block(self, args):
+        # Note: 'library' est maintenant un dictionnaire (classified_library)
+        y, x, target_block, classified_library = args
         t_mean = np.mean(target_block)
         t_std = np.std(target_block)
 
+        # Optimisation 1 : Saut des blocs plats
+        if t_std < 0.02:
+            return (y, x, (0, 0, 0.0, t_mean))
+
+        # NOUVEAU : On classifie le bloc cible
+        target_class = self._classify_block(target_block)
+
+        # On ne récupère QUE les candidats qui ont la même classe
+        # Cela réduit l'espace de recherche drastiquement (~ / 24).
+        candidates = classified_library.get(target_class, [])
+
         min_error = float('inf')
         best_trans = (0, 0, 0.0, t_mean)
+        acceptable_error = 1e-5
 
-        for src_idx, (source_block, (s_mean, s_std)) in enumerate(zip(sources, source_stats)):
-            # Filtrage rapide
+        for source_block, src_idx, orientation, s_mean, s_std in candidates:
             if (abs(s_mean - t_mean) > self.threshold_mean or
                     abs(s_std - t_std) > self.threshold_std):
                 continue
 
-            # Test des orientations
-            for orientation, candidate in enumerate(
-                    self.get_transforms_fast(source_block, self.max_orientations)
-            ):
-                s, o, error = self.compute_affine_params_fast(candidate, target_block)
+            s, o, error = self.compute_affine_params_fast(source_block, target_block)
+            if error < min_error:
+                min_error = error
+                best_trans = (src_idx, orientation, s, o)
 
-                if error < min_error:
-                    min_error = error
-                    best_trans = (src_idx, orientation, s, o)
+                # Optimisation 2 : Sortie anticipée
+                if min_error < acceptable_error:
+                    break
 
         return (y, x, best_trans)
 
-    def compress_frame(self, frame, channel_name="Frame", verbose=True):
-        """
-        Compresse une frame 2D avec parallélisation.
-        """
+    def _execute_parallel_compression(self, tasks, pool, progress_callback):
+        results = []
+        total_tasks = len(tasks)
+        chunksize = max(1, total_tasks // (self.n_jobs * 4))
+
+        iterator = pool.imap_unordered(self._process_target_block, tasks, chunksize=chunksize)
+
+        for i, res in enumerate(iterator):
+            results.append(res)
+            if progress_callback:
+                percent = (i + 1) / total_tasks * 100
+                progress_callback(percent)
+
+        return results
+
+    def compress_frame(self, frame, channel_name="Frame", verbose=True, progress_callback=None, pool=None):
         start_time = time.time()
         h, w = frame.shape
         source_block_size = self.block_size * 2
 
-        # ========== Extraction des blocs sources ==========
-        sources = []
-        source_stats = []
+        # 1. Génération et CLASSIFICATION de la bibliothèque
+        # On utilise un dictionnaire de listes au lieu d'une liste plate
+        library = {p: [] for p in permutations(range(4))}
+
+        raw_source_idx = 0
+        count_candidates = 0
 
         for y in range(0, h - source_block_size + 1, self.step):
             for x in range(0, w - source_block_size + 1, self.step):
                 block = frame[y:y + source_block_size, x:x + source_block_size]
                 reduced_block = self.reduce(block, 2)
-                sources.append(reduced_block)
-                source_stats.append((np.mean(reduced_block), np.std(reduced_block)))
 
-        n_sources = len(sources)
+                variations = self.get_transforms_fast(reduced_block, self.max_orientations)
+
+                for orient_idx, transformed_block in enumerate(variations):
+                    # On calcule la classe pour CHAQUE orientation
+                    # (car tourner le bloc change l'ordre des quadrants)
+                    block_class = self._classify_block(transformed_block)
+
+                    s_mean = np.mean(transformed_block)
+                    s_std = np.std(transformed_block)
+
+                    # On range dans le bon casier
+                    library[block_class].append(
+                        (transformed_block, raw_source_idx, orient_idx, s_mean, s_std)
+                    )
+                    count_candidates += 1
+
+                raw_source_idx += 1
 
         if verbose:
-            print(f"  [{channel_name}] Blocs {self.block_size}x{self.block_size}, "
-                  f"Step {self.step}, Sources: {n_sources}, "
-                  f"Max orientations: {self.max_orientations}")
+            print(f"[{channel_name}] Library built. {count_candidates} candidates distributed in 24 classes.")
 
-        # ========== Préparation des tâches ==========
+        # 2. Préparation tâches (on passe le dictionnaire 'library')
         tasks = []
         for y in range(0, h, self.block_size):
             for x in range(0, w, self.block_size):
                 target_block = frame[y:y + self.block_size, x:x + self.block_size]
-                tasks.append((y, x, target_block, sources, source_stats))
+                tasks.append((y, x, target_block, library))
 
-        # ========== Traitement parallèle ou séquentiel ==========
-        if self.use_parallel and len(tasks) > 100:
-            with Pool(processes=self.n_jobs) as pool:
-                results = pool.map(self._process_target_block, tasks)
+        # 3. Exécution
+        results = []
+
+        if self.use_parallel and len(tasks) > 50:
+            if pool:
+                results = self._execute_parallel_compression(tasks, pool, progress_callback)
+            else:
+                with Pool(processes=self.n_jobs) as local_pool:
+                    results = self._execute_parallel_compression(tasks, local_pool, progress_callback)
         else:
-            results = [self._process_target_block(task) for task in tasks]
+            total = len(tasks)
+            for i, task in enumerate(tasks):
+                results.append(self._process_target_block(task))
+                if progress_callback:
+                    progress_callback((i + 1) / total * 100)
 
-        # ========== Reconstruction de l'ordre des transformations ==========
+        # 4. Finalisation
         transform_dict = {(y, x): trans for y, x, trans in results}
         transforms = []
         for y in range(0, h, self.block_size):
@@ -179,31 +204,23 @@ class FractalCompressor:
                 transforms.append(transform_dict.get((y, x), (0, 0, 0.0, 0.0)))
 
         compression_time = time.time() - start_time
-
-        # ========== Statistiques ==========
         transform_size = len(transforms) * 4 * 4
         original_size = h * w
-        compression_ratio = original_size / transform_size if transform_size > 0 else 0
+        ratio = original_size / transform_size if transform_size > 0 else 0
 
         self.last_compression_stats = {
             'time': compression_time,
-            'blocks': len(transforms),
-            'compression_ratio': compression_ratio,
-            'transform_size': transform_size,
-            'original_size': original_size,
-            'parallel': self.use_parallel,
-            'n_jobs': self.n_jobs if self.use_parallel else 1
+            'ratio': ratio,
+            'psnr': 0
         }
 
         if verbose:
-            print(f"  Compression: {compression_time:.2f}s, "
-                  f"Ratio: {compression_ratio:.2f}x, "
-                  f"Jobs: {self.last_compression_stats['n_jobs']}")
+            print(f"[{channel_name}] Compressed in {compression_time:.2f}s")
 
         return transforms
 
     def decompress_frame(self, transforms, shape, iterations=8, verbose=True):
-        """Reconstruit une frame à partir des transformations IFS."""
+        # La décompression ne change PAS. Elle utilise juste les index stockés.
         start_time = time.time()
         h, w = shape
         factor = 2
@@ -211,7 +228,6 @@ class FractalCompressor:
 
         current_img = np.full((h, w), 0.5, dtype=np.float64)
 
-        # Pré-calcul des coordonnées
         src_coords = [
             (y, x)
             for y in range(0, h - source_block_size + 1, self.step)
@@ -224,16 +240,13 @@ class FractalCompressor:
             for x in range(0, w, self.block_size)
         ]
 
-        for iteration in range(iterations):
+        for i in range(iterations):
             new_img = np.zeros((h, w), dtype=np.float64)
-
-            # Extraction des sources
             current_sources = []
             for sy, sx in src_coords:
                 block = current_img[sy:sy + source_block_size, sx:sx + source_block_size]
                 current_sources.append(self.reduce(block, 2))
 
-            # Application des transformations
             for idx, (dy, dx) in enumerate(dest_coords):
                 if idx < len(transforms):
                     src_idx, orientation, s, o = transforms[idx]
@@ -241,48 +254,15 @@ class FractalCompressor:
                         src_block = current_sources[src_idx]
                         oriented = self.get_transforms_fast(src_block, 8)[orientation]
                         new_img[dy:dy + self.block_size, dx:dx + self.block_size] = s * oriented + o
-
             current_img = new_img
-
-        decompression_time = time.time() - start_time
-
-        if verbose:
-            print(f"  Décompression: {decompression_time:.2f}s ({iterations} itérations)")
 
         return np.clip(current_img, 0.0, 1.0)
 
-    def compute_psnr(self, original, reconstructed):
-        """Calcule le PSNR entre l'image originale et reconstruite."""
+    def evaluate(self, original, reconstructed):
         mse = np.mean((original - reconstructed) ** 2)
         if mse == 0:
-            return float('inf')
-        max_pixel = 1.0
-        psnr = 20 * np.log10(max_pixel / np.sqrt(mse))
-        return psnr
-
-    def evaluate(self, original, reconstructed):
-        """Évalue la qualité de la compression."""
-        mse = np.mean((original - reconstructed) ** 2)
-        psnr = self.compute_psnr(original, reconstructed)
-
-        stats = self.last_compression_stats.copy()
-        stats.update({
-            'mse': mse,
-            'psnr': psnr,
-        })
-
-        return stats
-
-    def print_stats(self, stats):
-        """Affiche les statistiques de manière lisible."""
-        print("\n=== Statistiques de compression ===")
-        print(f"Temps compression:    {stats['time']:.2f}s")
-        print(f"Parallélisation:      {stats['parallel']} ({stats['n_jobs']} jobs)")
-        print(f"Blocs traités:        {stats['blocks']}")
-        print(f"Taille originale:     {stats['original_size']} bytes")
-        print(f"Taille compressée:    {stats['transform_size']} bytes")
-        print(f"Ratio compression:    {stats['compression_ratio']:.2f}x")
-        if 'mse' in stats:
-            print(f"MSE:                  {stats['mse']:.6f}")
-            print(f"PSNR:                 {stats['psnr']:.2f} dB")
-        print("=" * 35)
+            psnr = 100.0
+        else:
+            psnr = 20 * np.log10(1.0 / np.sqrt(mse))
+        self.last_compression_stats['psnr'] = psnr
+        return self.last_compression_stats
